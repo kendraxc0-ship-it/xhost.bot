@@ -79,7 +79,10 @@ admin_ids = {ADMIN_ID, OWNER_ID}
 bot_locked = False
 
 # --- Verification State ---
+# Stores user IDs that are currently verified (session-based)
 verified_users = set()
+# Persist verification in DB to survive restarts
+VERIFIED_TABLE = 'verified_users'
 
 # --- Malware Detection Configuration ---
 MALWARE_SIGNATURES = [
@@ -120,7 +123,7 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Command Button Layouts ---
+# --- Command Button Layouts (ReplyKeyboardMarkup) ---
 COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
     ["📢 Updates Channel"],
     ["📤 Upload File", "📂 Check Files"],
@@ -171,6 +174,7 @@ def load_data():
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
 
+        # Load subscriptions
         c.execute('SELECT user_id, expiry FROM subscriptions')
         for user_id, expiry in c.fetchall():
             try:
@@ -178,18 +182,22 @@ def load_data():
             except ValueError:
                 logger.warning(f"⚠️ Invalid expiry date format for user {user_id}: {expiry}. Skipping.")
 
+        # Load user files
         c.execute('SELECT user_id, file_name, file_type FROM user_files')
         for user_id, file_name, file_type in c.fetchall():
             if user_id not in user_files:
                 user_files[user_id] = []
             user_files[user_id].append((file_name, file_type))
 
+        # Load active users
         c.execute('SELECT user_id FROM active_users')
         active_users.update(user_id for (user_id,) in c.fetchall())
 
+        # Load admins
         c.execute('SELECT user_id FROM admins')
         admin_ids.update(user_id for (user_id,) in c.fetchall())
 
+        # Load verified users
         c.execute('SELECT user_id FROM verified_users')
         verified_users.update(user_id for (user_id,) in c.fetchall())
 
@@ -198,15 +206,18 @@ def load_data():
     except Exception as e:
         logger.error(f"❌ Error loading data: {e}", exc_info=True)
 
+# Initialize DB and Load Data at startup
 init_db()
 load_data()
 # --- End Database Setup ---
 
 # --- VERIFICATION SYSTEM ---
 def is_user_verified(user_id):
+    """Check if user is verified (in-memory + DB)"""
     return user_id in verified_users
 
 def save_verified_user(user_id):
+    """Save verified user to DB and memory"""
     try:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
@@ -222,6 +233,7 @@ def save_verified_user(user_id):
         return False
 
 def remove_verified_user(user_id):
+    """Remove verified user from DB and memory"""
     try:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
@@ -236,7 +248,9 @@ def remove_verified_user(user_id):
         return False
 
 def check_channel_membership(user_id):
+    """Check if user is a member of the required channel. Returns (is_member, status)."""
     try:
+        # Skip verification for admins/owner if configured to bypass
         if user_id in admin_ids:
             return True, "admin"
 
@@ -250,6 +264,7 @@ def check_channel_membership(user_id):
             return False, status
     except telebot.apihelper.ApiTelegramException as e:
         if "user not found" in str(e).lower():
+            logger.warning(f"User {user_id} not found in channel (not a member)")
             return False, "not_found"
         elif "chat not found" in str(e).lower():
             logger.error(f"Channel {CHANNEL_USERNAME} not found or bot not admin")
@@ -262,41 +277,56 @@ def check_channel_membership(user_id):
         return False, "error"
 
 def require_verification(func):
+    """Decorator to enforce channel verification before allowing access"""
     def wrapper(message_or_call):
         user_id = None
         chat_id = None
+        is_callback = False
+        original_obj = None
 
+        # Extract user/chat info from message or callback
         if hasattr(message_or_call, 'from_user'):
             user_id = message_or_call.from_user.id
             chat_id = message_or_call.chat.id if hasattr(message_or_call, 'chat') else message_or_call.message.chat.id
+            original_obj = message_or_call
         elif hasattr(message_or_call, 'message') and hasattr(message_or_call.message, 'chat'):
             user_id = message_or_call.from_user.id
             chat_id = message_or_call.message.chat.id
+            is_callback = True
+            original_obj = message_or_call
         else:
             logger.warning(f"Unknown object type in require_verification: {type(message_or_call)}")
             return
 
+        # Admins bypass verification check if they are in admin_ids
         if user_id in admin_ids:
             return func(message_or_call)
 
+        # Check if user is already verified
         is_verified = is_user_verified(user_id)
 
+        # If verified, check if they're STILL a member (continuous validation)
         if is_verified:
             is_member, status = check_channel_membership(user_id)
             if is_member:
+                # Still verified, allow access
                 return func(message_or_call)
             else:
+                # User left the channel, revoke access
                 logger.warning(f"User {user_id} left channel, revoking verification.")
                 remove_verified_user(user_id)
+                # Show verification prompt
                 send_verification_prompt(chat_id, user_id)
                 return
 
+        # Not verified, show verification prompt
         send_verification_prompt(chat_id, user_id)
         return
 
     return wrapper
 
 def send_verification_prompt(chat_id, user_id):
+    """Send verification prompt to user"""
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("📢 Join Channel", url=UPDATE_CHANNEL),
@@ -312,6 +342,7 @@ def send_verification_prompt(chat_id, user_id):
         parse_mode='Markdown'
     )
 
+    # Store message ID to avoid duplicate prompts
     try:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
@@ -325,6 +356,7 @@ def send_verification_prompt(chat_id, user_id):
         logger.error(f"Error storing verification message ID: {e}")
 
 def clear_verification_prompt(chat_id, user_id):
+    """Delete existing verification prompt to avoid clutter"""
     try:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
@@ -341,27 +373,34 @@ def clear_verification_prompt(chat_id, user_id):
         logger.error(f"Error clearing verification prompt: {e}")
 
 def process_verification(call):
+    """Handle verification callback"""
     user_id = call.from_user.id
     chat_id = call.message.chat.id
 
+    # Prevent self-verification spoofing
     expected_user_id = int(call.data.split('_')[1])
     if user_id != expected_user_id:
         bot.answer_callback_query(call.id, "⚠️ You can only verify yourself.", show_alert=True)
         return
 
+    # Check membership
     is_member, status = check_channel_membership(user_id)
 
     if is_member:
+        # Success! Mark as verified and proceed
         save_verified_user(user_id)
         clear_verification_prompt(chat_id, user_id)
 
         bot.answer_callback_query(call.id, "✅ Verification Successful!")
         bot.send_message(chat_id, "✅ **Verification Successful!**\n\nYou are now verified. Loading the main menu...", parse_mode='Markdown')
 
+        # Send welcome/main menu
         _logic_send_welcome(call.message)
     else:
+        # Not a member
         bot.answer_callback_query(call.id, "❌ Verification Failed - You haven't joined the channel.", show_alert=True)
 
+        # Update prompt without duplicating
         clear_verification_prompt(chat_id, user_id)
 
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -381,6 +420,7 @@ def process_verification(call):
 
 # --- Malware Detection Functions ---
 def get_file_type(file_content):
+    """Determine file type using magic numbers and mimetypes"""
     signatures = {
         b'\x7fELF': 'application/x-executable',
         b'MZ': 'application/x-dosexec',
@@ -397,6 +437,7 @@ def get_file_type(file_content):
     return 'application/octet-stream'
 
 def is_suspicious_file(file_content, file_name):
+    """Check if file contains malware signatures, encrypted content, or suspicious keywords."""
     file_lower = file_name.lower()
     
     suspicious_extensions = ['.exe', '.dll', '.bat', '.cmd', '.scr', '.com', '.pif', '.application', '.gadget',
@@ -432,8 +473,15 @@ def is_suspicious_file(file_content, file_name):
     return False, "File appears safe"
 
 def scan_file_for_malware(file_content, file_name, user_id):
-    if user_id == OWNER_ID:
-        return True, "Owner bypassed security check"
+    """
+    Comprehensive malware scan for uploaded files.
+    ⭐ MODIFIED: Owner AND Admins bypass security check
+    """
+    # ✅ FIXED: Allow BOTH Owner AND Admins to bypass security
+    if user_id == OWNER_ID or user_id in admin_ids:
+        user_type = "Owner" if user_id == OWNER_ID else "Admin"
+        logger.info(f"🔓 {user_type} bypassed security check for {file_name}")
+        return True, f"{user_type} bypassed security check"
     
     is_suspicious, reason = is_suspicious_file(file_content, file_name)
     
@@ -445,11 +493,13 @@ def scan_file_for_malware(file_content, file_name, user_id):
 
 # --- Helper Functions ---
 def get_user_folder(user_id):
+    """Get or create user's folder for storing files"""
     user_folder = os.path.join(UPLOAD_BOTS_DIR, str(user_id))
     os.makedirs(user_folder, exist_ok=True)
     return user_folder
 
 def get_user_file_limit(user_id):
+    """Get the file upload limit for a user — strict enforcement."""
     if user_id == OWNER_ID:
         return OWNER_LIMIT
     if user_id in admin_ids:
@@ -458,12 +508,15 @@ def get_user_file_limit(user_id):
         expiry = user_subscriptions[user_id].get('expiry')
         if expiry and expiry > datetime.now():
             return SUBSCRIBED_USER_LIMIT
+    # Free user (no subscription) → exactly 1 file
     return FREE_USER_LIMIT
 
 def get_user_file_count(user_id):
+    """Get the number of files uploaded by a user"""
     return len(user_files.get(user_id, []))
 
 def is_bot_running(script_owner_id, file_name):
+    """Check if a bot script is currently running for a specific user"""
     script_key = f"{script_owner_id}_{file_name}"
     script_info = bot_scripts.get(script_key)
     if script_info and script_info.get('process'):
@@ -496,6 +549,7 @@ def is_bot_running(script_owner_id, file_name):
     return False
 
 def kill_process_tree(process_info):
+    """Kill a process and all its children, ensuring log file is closed."""
     pid = None
     log_file_closed = False
     script_key = process_info.get('script_key', 'N/A')
@@ -696,6 +750,7 @@ def attempt_install_npm(module_name, user_folder, message):
         return False
 
 def run_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply, attempt=1):
+    """Run Python script."""
     max_attempts = 2 
     if attempt > max_attempts:
         bot.reply_to(message_obj_for_reply, f"❌ Failed to run '{file_name}' after {max_attempts} attempts. Check logs.")
@@ -807,6 +862,7 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
              del bot_scripts[script_key]
 
 def run_js_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply, attempt=1):
+    """Run JS script."""
     max_attempts = 2
     if attempt > max_attempts:
         bot.reply_to(message_obj_for_reply, f"❌ Failed to run '{file_name}' after {max_attempts} attempts. Check logs.")
@@ -1032,7 +1088,7 @@ def remove_admin_db(admin_id):
         finally: conn.close()
 # --- End Database Operations ---
 
-# --- Menu creation ---
+# --- Menu creation (Inline and ReplyKeyboards) ---
 def create_main_menu_inline(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = [
@@ -1130,16 +1186,17 @@ def create_send_command_menu():
     return markup
 # --- End Menu Creation ---
 
-# --- File Handling ---
+# --- File Handling with Malware Detection ---
 def handle_zip_file(downloaded_file_content, file_name_zip, message):
     user_id = message.from_user.id
     user_folder = get_user_folder(user_id)
     temp_dir = None
     
-    if user_id != OWNER_ID:
+    # Security check for ZIP files (Owner & Admin bypass)
+    if user_id != OWNER_ID and user_id not in admin_ids:
         is_safe, reason = scan_file_for_malware(downloaded_file_content, file_name_zip, user_id)
         if not is_safe:
-            bot.reply_to(message, f"🚨 Security Alert: {reason}\nOnly owner can upload this type of file.")
+            bot.reply_to(message, f"🚨 Security Alert: {reason}\nOnly owner or admin can upload this type of file.")
             return
     
     try:
@@ -1149,19 +1206,23 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
         with open(zip_path, 'wb') as new_file:
             new_file.write(downloaded_file_content)
         
+        # Open Zip to Extract
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            if user_id != OWNER_ID:
+            # Additional security check on content (skip for Owner & Admin)
+            if user_id != OWNER_ID and user_id not in admin_ids:
                 for member in zip_ref.infolist():
                     member_name_lower = member.filename.lower()
                     suspicious_extensions = ['.exe', '.dll', '.bat', '.cmd', '.scr', '.com']
                     if any(member_name_lower.endswith(ext) for ext in suspicious_extensions):
-                        bot.reply_to(message, f"🚨 Security Alert: ZIP contains suspicious file: {member.filename}\nOnly owner can upload such files.")
+                        bot.reply_to(message, f"🚨 Security Alert: ZIP contains suspicious file: {member.filename}\nOnly owner or admin can upload such files.")
                         return
                     
+                    # Check for path traversal
                     member_path = os.path.abspath(os.path.join(temp_dir, member.filename))
                     if not member_path.startswith(os.path.abspath(temp_dir)):
                         raise zipfile.BadZipFile(f"Zip has unsafe path: {member.filename}")
             
+            # Extract everything
             zip_ref.extractall(temp_dir)
             logger.info(f"Extracted zip to {temp_dir}")
 
@@ -1292,8 +1353,9 @@ def handle_py_file(file_path, script_owner_id, user_folder, file_name, message):
         logger.error(f"❌ Error processing Python file {file_name} for {script_owner_id}: {e}", exc_info=True)
         bot.reply_to(message, f"❌ Error processing Python file: {str(e)}")
 
-# --- Send Command Functions ---
+# --- Send Command and Enhanced Logs Functions ---
 def _logic_send_command(message):
+    """Handle send command functionality"""
     user_id = message.from_user.id
     if bot_locked and user_id not in admin_ids:
         bot.reply_to(message, "⚠️ Bot locked by admin.")
@@ -1302,6 +1364,7 @@ def _logic_send_command(message):
     bot.reply_to(message, "📤 Send Command Options:", reply_markup=create_send_command_menu())
 
 def send_to_process_init(message):
+    """Initialize process for sending command to a running script"""
     user_id = message.from_user.id
     chat_id = message.chat.id
     
@@ -1324,6 +1387,7 @@ def send_to_process_init(message):
     bot.reply_to(message, "📝 Select a running script to send command to:", reply_markup=markup)
 
 def process_send_command(message, script_key):
+    """Process the actual command to send to the script"""
     user_id = message.from_user.id
     chat_id = message.chat.id
     
@@ -1351,6 +1415,7 @@ def process_send_command(message, script_key):
         bot.reply_to(message, f"❌ Error sending command: {str(e)}")
 
 def view_all_logs(message):
+    """Show all available logs for user"""
     user_id = message.from_user.id
     chat_id = message.chat.id
     
@@ -1378,6 +1443,7 @@ def view_all_logs(message):
     bot.reply_to(message, "📜 Available Log Files:", reply_markup=markup)
 
 def send_log_file(message, log_path, log_filename):
+    """Send log file as document"""
     try:
         file_size = os.path.getsize(log_path)
         if file_size > 50 * 1024 * 1024:
@@ -1391,7 +1457,7 @@ def send_log_file(message, log_path, log_filename):
         logger.error(f"Error sending log file {log_path}: {e}")
         bot.reply_to(message, f"❌ Error sending log file: {str(e)}")
 
-# --- Logic Functions ---
+# --- Logic Functions (called by commands and text handlers) ---
 @require_verification
 def _logic_send_welcome(message):
     user_id = message.from_user.id
@@ -1427,6 +1493,7 @@ def _logic_send_welcome(message):
     limit_str = str(file_limit) if file_limit != float('inf') else "Unlimited"
     expiry_info = ""
     
+    # Determine user status with clear tier labels
     if user_id == OWNER_ID:
         user_status = "👑 Owner"
     elif user_id in admin_ids:
@@ -1475,6 +1542,7 @@ def _logic_upload_file(message):
     file_limit = get_user_file_limit(user_id)
     current_files = get_user_file_count(user_id)
     
+    # Determine tier for display
     if user_id in admin_ids:
         tier = "Admin"
     elif user_id in user_subscriptions and user_subscriptions[user_id].get('expiry', datetime.min) > datetime.now():
@@ -1668,9 +1736,10 @@ def _logic_run_all_scripts(message_or_call):
     reply_func(summary_msg, parse_mode='Markdown')
     logger.info(f"Run all scripts finished. Admin: {admin_user_id}. Started: {started_count}. Skipped/Errors: {skipped_files}")
 
-# --- Command Handlers ---
+# --- Command Handlers & Text Handlers for ReplyKeyboard ---
 @bot.message_handler(commands=['start', 'help'])
 def command_send_welcome(message):
+    # Check verification first, then welcome
     user_id = message.from_user.id
     if user_id in admin_ids:
         _logic_send_welcome(message)
@@ -1706,6 +1775,7 @@ BUTTON_TEXT_TO_LOGIC = {
 def handle_button_text(message):
     user_id = message.from_user.id
     
+    # Check verification for non-admins
     if user_id not in admin_ids:
         is_member, status = check_channel_membership(user_id)
         if not is_member:
@@ -1748,12 +1818,13 @@ def ping(message):
     latency = round((time.time() - start_ping_time) * 1000, 2)
     bot.edit_message_text(f"Pong! Latency: {latency} ms", message.chat.id, msg.message_id)
 
-# --- Document (File) Handler ---
+# --- Document (File) Handler with Malware Detection ---
 @bot.message_handler(content_types=['document'])
 def handle_file_upload_doc(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     
+    # Check verification for non-admins
     if user_id not in admin_ids:
         is_member, status = check_channel_membership(user_id)
         if not is_member:
@@ -1770,6 +1841,7 @@ def handle_file_upload_doc(message):
     file_limit = get_user_file_limit(user_id)
     current_files = get_user_file_count(user_id)
     
+    # Determine tier for display
     if user_id in admin_ids:
         tier = "Admin"
     elif user_id in user_subscriptions and user_subscriptions[user_id].get('expiry', datetime.min) > datetime.now():
@@ -1777,6 +1849,7 @@ def handle_file_upload_doc(message):
     else:
         tier = "Free"
     
+    # ENFORCED LIMIT CHECK
     if current_files >= file_limit:
         limit_str = str(file_limit) if file_limit != float('inf') else "Unlimited"
         bot.reply_to(message, f"⚠️ {tier} limit reached ({current_files}/{limit_str}). Delete files first.")
@@ -1802,11 +1875,16 @@ def handle_file_upload_doc(message):
         file_info_tg_doc = bot.get_file(doc.file_id)
         downloaded_file_content = bot.download_file(file_info_tg_doc.file_path)
         
-        if user_id != OWNER_ID:
+        # ⭐ FIXED: Owner AND Admins bypass security check
+        if user_id != OWNER_ID and user_id not in admin_ids:
             is_safe, reason = scan_file_for_malware(downloaded_file_content, file_name, user_id)
             if not is_safe:
                 bot.edit_message_text(f"🚨 Security Alert: {reason}", chat_id, download_wait_msg.message_id)
                 return
+        else:
+            user_type = "Owner" if user_id == OWNER_ID else "Admin"
+            logger.info(f"🔓 {user_type} bypassed security for {file_name}")
+            bot.edit_message_text(f"✅ {user_type} bypass activated. Processing {file_name}...", chat_id, download_wait_msg.message_id)
         
         bot.edit_message_text(f"✅ Downloaded `{file_name}`. Processing...", chat_id, download_wait_msg.message_id)
         logger.info(f"Downloaded {file_name} for user {user_id}")
@@ -1829,21 +1907,24 @@ def handle_file_upload_doc(message):
         logger.error(f"❌ General error handling file for {user_id}: {e}", exc_info=True)
         bot.reply_to(message, f"❌ Unexpected error: {str(e)}")
 
-# --- Callback Query Handlers ---
+# --- Callback Query Handlers (for Inline Buttons) ---
 @bot.callback_query_handler(func=lambda call: True) 
 def handle_callbacks(call):
     user_id = call.from_user.id
     data = call.data
     logger.info(f"Callback: User={user_id}, Data='{data}'")
 
+    # Handle verification callback first (no restrictions)
     if data.startswith('verify_'):
         process_verification(call)
         return
 
+    # Check bot lock
     if bot_locked and user_id not in admin_ids and data not in ['back_to_main', 'speed', 'stats']:
         bot.answer_callback_query(call.id, "⚠️ Bot locked by admin.", show_alert=True)
         return
 
+    # Check verification for non-admins
     if user_id not in admin_ids:
         is_member, status = check_channel_membership(user_id)
         if not is_member:
@@ -1902,7 +1983,7 @@ def owner_required_callback(call, func_to_run):
         return
     func_to_run(call)
 
-# --- Callback functions ---
+# --- Callback functions (existing) ---
 def send_command_callback(call):
     bot.answer_callback_query(call.id)
     try:
@@ -1955,11 +2036,12 @@ def viewlog_callback(call):
         logger.error(f"Error in viewlog_callback: {e}")
         bot.answer_callback_query(call.id, "Error viewing log.")
 
-# ===== FIXED UPLOAD CALLBACK =====
 def upload_callback(call):
     user_id = call.from_user.id
+    file_limit = get_user_file_limit(user_id)
+    current_files = get_user_file_count(user_id)
     
-    # Determine tier FIRST (outside the limit check)
+    # Determine tier for display
     if user_id in admin_ids:
         tier = "Admin"
     elif user_id in user_subscriptions and user_subscriptions[user_id].get('expiry', datetime.min) > datetime.now():
@@ -1967,26 +2049,12 @@ def upload_callback(call):
     else:
         tier = "Free"
     
-    file_limit = get_user_file_limit(user_id)
-    current_files = get_user_file_count(user_id)
-    
-    # Check limit
     if current_files >= file_limit:
         limit_str = str(file_limit) if file_limit != float('inf') else "Unlimited"
         bot.answer_callback_query(call.id, f"⚠️ {tier} limit reached ({current_files}/{limit_str}).", show_alert=True)
         return
-    
-    # Send the upload prompt
-    bot.answer_callback_query(call.id, "📤 Ready for upload!")
-    bot.send_message(
-        call.message.chat.id,
-        f"📤 **Send your file**\n\n"
-        f"Supported formats: `.py`, `.js`, `.zip`\n"
-        f"📊 Your limit: {current_files}/{file_limit if file_limit != float('inf') else '∞'}\n"
-        f"👤 Tier: {tier}\n\n"
-        f"Just send the file and I'll handle the rest.",
-        parse_mode='Markdown'
-    )
+    bot.answer_callback_query(call.id) 
+    bot.send_message(call.message.chat.id, f"📤 Send your Python (`.py`), JS (`.js`), or ZIP (`.zip`) file.\n📊 {tier} limit: {current_files}/{limit_str if file_limit != float('inf') else '∞'}")
 
 def check_files_callback(call):
     user_id = call.from_user.id
@@ -2370,6 +2438,7 @@ def back_to_main_callback(call):
     limit_str = str(file_limit) if file_limit != float('inf') else "Unlimited"
     expiry_info = ""
     
+    # Determine user status with clear tier labels
     if user_id == OWNER_ID:
         user_status = "👑 Owner"
     elif user_id in admin_ids:
